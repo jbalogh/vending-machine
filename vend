@@ -1,0 +1,216 @@
+#!/usr/bin/env python
+# Sync reqs.txt and vendor
+# Rewrite reqs.txt (pip freeze)
+import logging as log
+import os
+import pkg_resources
+import shutil
+import site
+import sys
+
+import argparse
+import pip
+import pip.req
+
+log.basicConfig(format='[%(levelname)s] %(msg)s', level=log.INFO)
+
+
+def exit(msg):
+    log.error(msg)
+    sys.exit(1)
+
+
+def run(cmd):
+    log.info(cmd)
+    os.system(cmd)
+
+
+def cd(path):
+    log.info('cd ' + path)
+    os.chdir(path)
+
+
+def add_site_dirs(vendor):
+    # Add vendor to sys.path so we can find packages there.
+    site.addsitedir(vendor)
+    site.addsitedir(os.path.join(vendor, 'lib', 'python'))
+    # Resync pkg_resources so pip can find packages in vendor.
+    working_set = pkg_resources.WorkingSet(sys.path)
+    pkg_resources.working_set = working_set
+
+
+def sync_command(args):
+    vendor = os.path.abspath(args.dir)
+    if os.path.exists(vendor):
+        exit("I don't know how to work with an existing vendor yet.")
+
+    log.info('Creating vendor directory at %s.' % vendor)
+    os.makedirs(vendor)
+
+    # Load pip's commands and vcs modules.
+    pip.load_all_commands()
+    pip.version_control()
+    options = pip.parser.parse_args([])[0]
+
+    # Load the requirements files.
+    reqs = []
+    for req_file in [args.requirement]:
+        reqs.extend(pip.req.parse_requirements(req_file, options=options))
+
+    log.info('Adding packaged dependencies.')
+    opts = ['install', '-I', '--install-option=--home=%s' % vendor]
+    opts.extend(r.name for r in reqs if not r.editable)
+    pip.main(opts)
+
+    log.info('Adding src dependencies.')
+    opts = ['install', '-I', '--src=%s/src' % vendor]
+    opts.extend('-e%s' % r.url for r in reqs if r.editable)
+    pip.main(opts)
+
+    log.info('Setting up the submodules.')
+    cd(vendor)
+    run('git init')
+    with open('vendor.pth', 'w') as fd:
+        for req in reqs:
+            if req.editable:
+                name = 'src/%s' % req.name
+                fd.write(name + '\n')
+                end = req.url.index('#')
+                if '@' in req.url:
+                    end = req.url.index('@')
+                run('git submodule add %s %s' % (req.url[4:end], name))
+    run('git add lib vendor.pth')
+
+    run('git commit -m "a new vendor lib is born!"')
+    log.info('Your new vendor lib is ready.')
+
+
+def freeze_command(opts):
+    vendor = os.path.abspath(args.dir)
+    # Hide packages installed locally.
+    for path in sys.path:
+        if 'site-packages' in path:
+            sys.path.remove(path)
+    add_site_dirs(vendor)
+    pip.main(['freeze'])
+
+
+def update_command(opts):
+    vendor = os.path.abspath(args.dir)
+    package, version = args.package, args.version
+
+    src = os.path.join(vendor, 'src', package)
+    if os.path.exists(src):
+        log.info('Updating src/%s to %s' % (package, version))
+        cd(src)
+        if not os.path.isdir('.git'):
+            exit('I only know git.')
+
+        run('git fetch')
+        run('git checkout %s' % version)
+        cd(vendor)
+        run('git add src/%s' % package)
+        run("git commit -m 'updating src/%s to %s'" % (package, version))
+    else:
+        log.info('Removing %s before upgrading.' % package)
+        uninstall_command(opts)
+
+        log.info('Updating %s to %s.' % (package, version))
+        opts = ['install', '-I', '--install-option=--home=%s' % vendor,
+                '%s==%s' % (package, version)]
+        pip.main(opts)
+        cd(vendor)
+        run('git add -A lib')
+        run("git commit -m 'updating %s to %s'" % (package, version))
+
+
+def uninstall_command(opts):
+    vendor = os.path.abspath(args.dir)
+    package = args.package
+    add_site_dirs(vendor)
+
+    src = os.path.join(vendor, 'src', package)
+    if os.path.exists(src):
+        log.info('Removing src/%s.' % package)
+        gitmod = os.path.join(vendor, '.gitmodules')
+        modules = open(gitmod).readlines()
+        with open(gitmod, 'w') as fd:
+            mod_iter = iter(modules)
+            for line in mod_iter:
+                # Skip the submodule lines. This is really ghetto.
+                if line.startswith('[submodule "src/%s"]' % package):
+                    mod_iter.next(); mod_iter.next()
+                else:
+                    fd.write(line)
+        cd(vendor)
+        run('git rm --cached %s' % src)
+        shutil.rmtree(src)
+        run("git commit -m 'removing src/%s'" % package)
+    else:
+        log.info('Removing %s.' % package)
+        # Make pip think we're not in a virtualenv.  Otherwise it
+        # refuses to delete from vendor.
+        del sys.real_prefix
+        pip.main(['uninstall', package])
+
+        cd(vendor)
+        run('git add -A lib')
+        run("git commit -m 'removing %s'" % package)
+
+
+def add_command(opts):
+    vendor = os.path.abspath(args.dir)
+    package = args.package
+
+    if package.startswith('git'):
+        log.info('Adding %s as a submodule.' % package)
+        opts = ['install', '-I', '--src=%s/src' % vendor, '-e=%s' % package]
+        pip.main(opts)
+
+        cd(vendor)
+        with open('vendor.pth', 'a') as fd:
+            # TODO: name = parse_req(package).name
+            fd.write('%s\n' % name)
+        run('git submodule add %s %s' % (req.url, name))
+        run('git add vendor.pth')
+        run("git commit -m 'adding %s'" % name)
+    else:
+        log.info('Adding %s.' % package)
+        opts = ['install', '-I', '--install-option=--home=%s' % vendor,
+                package]
+        pip.main(opts)
+        cd(vendor)
+        run('git add -A lib')
+        run("git commit -m 'adding %s'" % package)
+
+
+parser = argparse.ArgumentParser()
+sub = parser.add_subparsers()
+parser.add_argument('-d', '--dir', help='path to the vendor directory',
+                    default='vendor')
+
+sync = sub.add_parser('sync', help='sync requirements file with vendor')
+sync.set_defaults(func=sync_command)
+sync.add_argument('-r', '--requirement', help='Use this requirements file',
+                  metavar='FILENAME', required=True)
+
+freeze = sub.add_parser('freeze',
+                        help='freeze requirements for the vendor repo')
+freeze.set_defaults(func=freeze_command)
+
+update = sub.add_parser('update', help='update a package or submodule')
+update.set_defaults(func=update_command)
+update.add_argument('package', help='name of the package or submodule')
+update.add_argument('version', help='version or revision to update to')
+
+uninstall = sub.add_parser('uninstall',
+                           help='uninstall a package or submodule')
+uninstall.set_defaults(func=uninstall_command)
+uninstall.add_argument('package', help='name of the package or submodule')
+
+add = sub.add_parser('add', help='add a package or submodule')
+add.set_defaults(func=add_command)
+add.add_argument('package', help='name of the package or submodule')
+
+args = parser.parse_args()
+args.func(args)

@@ -168,14 +168,16 @@ def add_command(opts):
 
     if package.startswith('git'):
         log.info('Adding %s as a submodule.' % package)
-        opts = ['install', '-I', '--src=%s/src' % vendor, '-e=%s' % package]
+        opts = ['install', '-I', '--src=%s/src' % vendor, '-e%s' % package]
         pip.main(opts)
 
+        req = pip.req.InstallRequirement.from_editable(package)
         cd(vendor)
         with open('vendor.pth', 'a') as fd:
-            # TODO: name = parse_req(package).name
-            fd.write('%s\n' % name)
-        run('git submodule add %s %s' % (req.url, name))
+            name = req.name
+            fd.write('src/%s\n' % name)
+        end = req.url.index('#')
+        run('git submodule add %s src/%s' % (req.url[4:end], name))
         run('git add vendor.pth')
         run("git commit -m 'adding %s'" % name)
     else:

@@ -59,7 +59,11 @@ def sync_command(args):
 
     log.info('Adding packaged dependencies.')
     opts = ['install', '-I', '--install-option=--home=%s' % vendor]
-    opts.extend(r.name for r in reqs if not r.editable)
+    for req in [r for r in reqs if not r.editable]:
+        if req.req.specs:
+            opts.append('%s%s' % (req.name, ''.join(req.req.specs[0])))
+        else:
+            opts.append(req.name)
     pip.main(opts)
 
     log.info('Adding src dependencies.')
